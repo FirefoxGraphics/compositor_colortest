@@ -13,7 +13,46 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dcomp.lib")
+#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "gdiplus.lib")
+
+#ifndef WINVER              // Allow use of features specific to Windows 7 or later.
+#define WINVER 0x0A00       // Change this to the appropriate value to target other versions of Windows.
+#endif
+
+#ifndef _WIN32_WINNT        // Allow use of features specific to Windows 7 or later.
+#define _WIN32_WINNT 0x0A00 // Change this to the appropriate value to target other versions of Windows.
+#endif
+
+#ifndef UNICODE
+#define UNICODE
+#endif
+
+#define WIN32_LEAN_AND_MEAN     // Exclude rarely-used items from Windows headers
+
+#include <array>
+#include <cassert>
+#include <chrono>
+#include <cstdlib>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>      // std::setprecision
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+using std::move;
+using std::vector;
+using std::string;
+using std::unique_ptr;
+using std::shared_ptr;
+namespace chrono = std::chrono;
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -23,6 +62,15 @@
 #include <KnownFolders.h>
 #include <ShlObj.h>
 
+template <class T> void SafeRelease(T** ppT)
+{
+    if (*ppT)
+    {
+        (*ppT)->Release();
+        *ppT = NULL;
+    }
+}
+
 #include "framework.h"
 #include "testcolorspaces.h"
 
@@ -31,8 +79,11 @@
 // Global Variables:
 HINSTANCE hInst;                                // current instance
 HWND hWindow;
+u32 win_dpiX;
+u32 win_dpiY;
 WCHAR szTitle[MAX_LOADSTRING];                  // The title bar text
 WCHAR szWindowClass[MAX_LOADSTRING];            // the main window class name
+static Compositor_State* compositor;
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -62,8 +113,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_TESTCOLORSPACES));
-
-    Compositor_Start();
 
     MSG msg;
 
@@ -122,8 +171,20 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 {
    hInst = hInstance; // Store instance handle in our global variable
 
+   win_dpiX = 96;
+   win_dpiY = 96;
+   HDC hdc = GetDC(NULL);
+   if (hdc)
+   {
+       win_dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+       win_dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
+       ReleaseDC(NULL, hdc);
+   }
+   u32 width = static_cast<u32>(ceil(640.0f * win_dpiX / 96.f));
+   u32 height = static_cast<u32>(ceil(480.0f * win_dpiY / 96.f));
+
    HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-      CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
+      CW_USEDEFAULT, 0, width, height, nullptr, nullptr, hInstance, nullptr);
 
    if (!hWnd)
    {
@@ -133,6 +194,8 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    hWindow = hWnd;
    ShowWindow(hWnd, nCmdShow);
    UpdateWindow(hWnd);
+
+   compositor = Compositor_New(hWnd, win_dpiX, win_dpiY);
 
    return TRUE;
 }
@@ -207,25 +270,322 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 
 struct Compositor_State
 {
+    Compositor_Scene scene;
+    Compositor_Status status;
     HWND hWindow;
+    u32 dpiX;
+    u32 dpiY;
     ID3D11Device* d3d;
     IDXGIDevice* dxgi;
+    IDXGIAdapter* adapter;
+    IDXGIFactory2* factory;
     IDCompositionDevice* dcomp;
+    IDCompositionTarget* dcomptarget;
     ID3D11DeviceContext* context;
-}
-comp;
+    IDCompositionVisual* rootvisual;
+};
 
-void Compositor_Start()
+Compositor_State* Compositor_New(void* windowhandle, u16 dpi_x, u16 dpi_y)
 {
-    u32 flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    flags |= D3D11_CREATE_DEVICE_DEBUG;
+    Compositor_State* comp;
+    comp = (Compositor_State*)calloc(1, sizeof(*comp));
+    if (comp)
+    {
+        comp->status = Compositor_Status_No_Device;
+        comp->dpiX = dpi_x;
+        comp->dpiY = dpi_y;
+    }
+    return comp;
+}
 
-    constexpr auto FEATURE_LEVELS = std::array{
+static void Compositor_UncreateDevice(Compositor_State* comp)
+{
+    SafeRelease(&comp->rootvisual);
+    SafeRelease(&comp->adapter);
+    SafeRelease(&comp->factory);
+    SafeRelease(&comp->dxgi);
+    SafeRelease(&comp->dcomp);
+    SafeRelease(&comp->dcomptarget);
+    SafeRelease(&comp->context);
+    SafeRelease(&comp->d3d);
+}
+
+void Compositor_Destroy(Compositor_State* comp)
+{
+    Compositor_UncreateDevice(comp);
+    free(comp);
+}
+
+void Compositor_CreateDevice(Compositor_State *comp)
+{
+    switch (comp->status)
+    {
+    case Compositor_Status_Running:
+        return;
+    default:
+        break;
+    }
+
+    comp->status = Compositor_Status_Device_Creation_Failed;
+
+    u32 flags =
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+        D3D11_CREATE_DEVICE_DEBUG;
+
+    constexpr D3D_FEATURE_LEVEL feature_levels[] = {
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
         D3D_FEATURE_LEVEL_10_0,
     };
 
+    D3D_FEATURE_LEVEL featureLevelSupported = feature_levels[0];
 
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        NULL,
+        flags,
+        feature_levels,
+        sizeof(feature_levels) / sizeof(feature_levels[0]),
+        D3D11_SDK_VERSION,
+        &comp->d3d,
+        &featureLevelSupported,
+        nullptr);
+    if (!SUCCEEDED(hr))
+        return;
+
+    hr = comp->d3d->QueryInterface(&comp->dxgi);
+    if (!SUCCEEDED(hr))
+        return;
+
+    hr = DCompositionCreateDevice(
+        comp->dxgi,
+        __uuidof(IDCompositionDevice),
+        reinterpret_cast<void**>(&comp->dcomp));
+    if (!SUCCEEDED(hr))
+        return;
+
+    hr = comp->dcomp->CreateTargetForHwnd(comp->hWindow, TRUE, &comp->dcomptarget);
+    if (!SUCCEEDED(hr))
+        return;
+
+    hr = comp->dcomp->CreateVisual(&comp->rootvisual);
+    if (!SUCCEEDED(hr))
+        return;
+
+    hr = comp->dxgi->GetAdapter(&comp->adapter);
+    if (!SUCCEEDED(hr))
+        return;
+
+    hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&comp->factory));
+    if (!SUCCEEDED(hr))
+        return;
+
+    comp->status = Compositor_Status_Running;
 }
+
+void Compositor_CheckDeviceState(Compositor_State *comp)
+{
+    if (comp->dcomp)
+    {
+        BOOL bIsValid = FALSE;
+        HRESULT res = comp->dcomp->CheckDeviceState(&bIsValid);
+        if (res != S_OK || !bIsValid)
+        {
+            comp->status = Compositor_Status_Device_Lost;
+            Compositor_CreateDevice(comp);
+        }
+    }
+    else
+        Compositor_CreateDevice(comp);
+}
+
+const f32 testcolors[3][5] = {
+    {1.0f, 0.4f, 0.1f, 0.1f, 0.4f},
+    {0.4f, 1.0f, 1.0f, 0.4f, 0.1f},
+    {0.1f, 0.1f, 0.4f, 1.0f, 1.0f}
+};
+
+static void Generate_Colorspace_Test_Pattern_Pixel(float p[], f32 pos[])
+{
+    constexpr u32 limit = sizeof(testcolors[0]) / sizeof(testcolors[0][0]);
+    constexpr u32 limit1 = limit - 1;
+    constexpr u32 limit2 = limit - 2;
+    f32 f = pos[0] * limit;
+    f = f < 0.0f ? 0.0f : f < (float)limit1 ? f : (float)limit;
+    u32 i = (int)f;
+    i = i < 0 ? 0 : i < limit2 ? i : limit2;
+    f32 lerp = f - i;
+    f32 ilerp = 1.0f - lerp;
+    for (u32 c = 0;c < 3;c++)
+        p[c] = testcolors[c][i] * ilerp + testcolors[c][i + 1] * lerp;
+    p[3] = 1.0f;
+}
+
+static void Pixel_EncodesRGB(f32 c[], f32 o[])
+{
+    for (u32 i = 0; i < 3; i++)
+    {
+        f32 f = c[i];
+        o[i] = f < 0.0031308f ? f * 12.92f : 1.055f * pow(f, 0.41666f) - 0.055f;
+    }
+    o[3] = c[3];
+}
+
+static void Pixel_Modulate_And_Clamp(f32 c[], f32 scale, f32 low, f32 high)
+{
+    for (u32 i = 0; i < 32; i++)
+    {
+        f32 f = c[i];
+        f *= scale;
+        f = f < low ? low : f < high ? f : high;
+        c[i] = f;
+    }
+}
+
+static void Generate_Colorspace_Test_Pattern_BGRA8(u32* pixels, u16 width, u16 height)
+{
+    for (u32 y = 0; y < height; y++)
+    {
+        for (u32 x = 0; x < width; x++)
+        {
+            auto p = pixels + y * width + x;
+            f32 pos[2];
+            f32 c[4];
+            pos[0] = x * (1.0f / width);
+            pos[1] = y * (1.0f / height);
+            Generate_Colorspace_Test_Pattern_Pixel(c, pos);
+            Pixel_EncodesRGB(c, c);
+            Pixel_Modulate_And_Clamp(c, 255.0f, 0.0f, 255.0f);
+            *p = 
+                (u32)c[0] * 0x1 +
+                (u32)c[1] * 0x100 +
+                (u32)c[2] * 0x10000 +
+                (u32)c[3] * 0x1000000;
+        }
+    }
+}
+
+static void Generate_Colorspace_Test_Pattern_BGR10A2(u32* pixels, u16 width, u16 height)
+{
+    for (u32 y = 0; y < height; y++)
+    {
+        for (u32 x = 0; x < width; x++)
+        {
+            auto p = pixels + y * width + x;
+            f32 pos[2];
+            f32 c[4];
+            pos[0] = x * (1.0f / width);
+            pos[1] = y * (1.0f / height);
+            Generate_Colorspace_Test_Pattern_Pixel(c, pos);
+            Pixel_EncodesRGB(c, c);
+            Pixel_Modulate_And_Clamp(c, 1023.0f, 0.0f, 1023.0f);
+            *p = 
+                (u32)c[0] * 0x1 +
+                (u32)c[1] * 0x400 +
+                (u32)c[2] * 0x100000 +
+                ((u32)c[3] >> 8) * 0xC0000000;
+        }
+    }
+}
+
+/// This converts an f32 to an f16 using bit manipulation (which achieves round
+/// to nearest behavior, which may not be the active floating point mode).
+/// See https://en.wikipedia.org/wiki/Half-precision_floating-point_format and
+/// compare to https://en.wikipedia.org/wiki/Single-precision_floating-point_format
+static u16 ToF16(f32 f)
+{
+    union
+    {
+        f32 f;
+        u32 i;
+    }
+    u;
+    u.f = f;
+    u32 i = u.i;
+    return ((i & 0x8000) >> 16) | ((i & 0x7C000000) >> 13) | ((i & 0x007FE000) >> 13);
+}
+
+static void Generate_Colorspace_Test_Pattern_RGBA16F(u64* pixels, u16 width, u16 height)
+{
+    for (u32 y = 0; y < height; y++)
+    {
+        for (u32 x = 0; x < width; x++)
+        {
+            auto p = pixels + y * width + x;
+            f32 pos[2];
+            f32 c[4];
+            pos[0] = x * (1.0f / width);
+            pos[1] = y * (1.0f / height);
+            Generate_Colorspace_Test_Pattern_Pixel(c, pos);
+            *p = 
+                (u64)ToF16(c[0]) * 0x1ull +
+                (u64)ToF16(c[1]) * 0x10000ull + 
+                (u64)ToF16(c[2]) * 0x100000000ull + 
+                (u64)ToF16(c[3]) * 0x1000000000000ull;
+        }
+    }
+}
+
+static bool Compositor_Make_Colorspace_Test_Scene(Compositor_State* comp)
+{
+    // Create test gradients for several colorspaces
+    comp->scene.ready = 1;
+    for (u32 i = 0; i < 16; i++)
+    {
+        u32 width = 512 * comp->dpiX / 96;
+        u32 height = 32 * comp->dpiY / 96;
+        IDCompositionVisual* visual = NULL;
+        HRESULT hr = comp->dcomp->CreateVisual(&visual);
+        if (!SUCCEEDED(hr))
+            return false;
+        visual->SetOffsetX(0.0f);
+        visual->SetOffsetY(i * height * 1.0f);
+        DXGI_SWAP_CHAIN_DESC1 scdesc = {};
+        scdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        scdesc.SampleDesc.Count = 1;
+        scdesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scdesc.BufferCount = 2;
+        scdesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        scdesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        scdesc.Width = width;
+        scdesc.Height = height;
+        scdesc.Stereo = FALSE;
+        scdesc.Scaling = DXGI_SCALING_STRETCH;
+        scdesc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        IDXGISwapChain1* swapchain;
+        hr = comp->factory->CreateSwapChainForComposition(comp->d3d, &scdesc, NULL, &swapchain);
+        if (!SUCCEEDED(hr))
+            return false;
+        ID3D11Resource* buffer;
+        hr = swapchain->GetBuffer(0, IID_PPV_ARGS(&buffer));
+        if (!SUCCEEDED(hr))
+            return false;
+        ID3D11RenderTargetView* view;
+        hr = comp->d3d->CreateRenderTargetView(buffer, NULL, &view);
+        if (!SUCCEEDED(hr))
+            return false;
+        f32 color[] = { i * 1.0f / 16.0f, 0.0f, 1.0f, 1.0f };
+        comp->context->ClearRenderTargetView(view, color);
+        buffer->Release();
+        view->Release();
+        hr = swapchain->Present(0, DXGI_PRESENT_RESTART);
+        if (!SUCCEEDED(hr))
+            return false;
+    }
+}
+
+void Compositor_Update(Compositor_State* comp, const Compositor_Scene* scene)
+{
+    Compositor_CheckDeviceState(comp);
+    if (comp->status != Compositor_Status_Running)
+        return;
+
+    // TODO: Actually create the scene definition semantics
+    if (!comp->scene.ready)
+    {
+        Compositor_Make_Colorspace_Test_Scene(comp);
+    }
+}
+
