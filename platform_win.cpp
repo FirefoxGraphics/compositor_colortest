@@ -16,6 +16,8 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "gdiplus.lib")
 
+#include "common.h"
+
 #ifndef WINVER              // Allow use of features specific to Windows 7 or later.
 #define WINVER 0x0A00       // Change this to the appropriate value to target other versions of Windows.
 #endif
@@ -29,6 +31,9 @@
 #endif
 
 #define WIN32_LEAN_AND_MEAN     // Exclude rarely-used items from Windows headers
+
+#include "framework.h"
+#include "Resource.h"
 
 #include <array>
 #include <cassert>
@@ -71,78 +76,24 @@ template <class T> void SafeRelease(T** ppT)
     }
 }
 
-#include "framework.h"
-#include "testcolorspaces.h"
 
-
-const f32 testcolors[3][5] = {
-    {1.0f, 0.4f, 0.1f, 0.1f, 0.4f},
-    {0.4f, 1.0f, 1.0f, 0.4f, 0.1f},
-    {0.1f, 0.1f, 0.4f, 1.0f, 1.0f}
-};
-
-static void Generate_Colorspace_Test_Pattern_Pixel(float output[], f32 x, f32 y, f32 width, f32 height)
-{
-    constexpr u32 limit = sizeof(testcolors[0]) / sizeof(testcolors[0][0]);
-    constexpr u32 limit1 = limit - 1;
-    constexpr u32 limit2 = limit - 2;
-    f32 f = (x / width) * limit;
-    f = f < 0.0f ? 0.0f : f < (float)limit1 ? f : (float)limit;
-    u32 i = (int)f;
-    i = i < 0 ? 0 : i < limit2 ? i : limit2;
-    f32 lerp = f - i;
-    f32 ilerp = 1.0f - lerp;
-    for (u32 c = 0; c < 3; c++)
-        output[c] = testcolors[c][i] * ilerp + testcolors[c][i + 1] * lerp;
-    output[3] = 1.0f;
-}
-
-static u64 Compositor_Scene_Test_Add_Layer(Compositor_Scene* scene, u64 refreshcounter, u64 z, Compositor_PixelFormat pixelformat, u16 x, u16 y, u16 width, u16 height, void (*pixelcallback)(f32 output[4], f32 x, f32 y, f32 width, f32 height))
-{
-    Compositor_Scene_Layer* layer = new Compositor_Scene_Layer();
-    layer->z = z;
-    layer->refreshcounter = refreshcounter;
-    layer->pixelformat = pixelformat;
-    layer->x = x;
-    layer->y = y;
-    layer->width = width;
-    layer->height = height;
-    scene->layers.push_back(layer);
-    return scene->layers.size() - 1;
-}
-
-void Compositor_Scene_Make_Colorspace_Test(Compositor_Scene* scene)
-{
-    u64 refreshcounter = 1;
-    u16 w = 256;
-    u16 h = 32;
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 0, Compositor_PixelFormat::rgba8_srgb, 0, h * 0, w, h, Generate_Colorspace_Test_Pattern_Pixel);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 1, Compositor_PixelFormat::rgba8_rec709, 0, h * 1, w, h, Generate_Colorspace_Test_Pattern_Pixel);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 2, Compositor_PixelFormat::rgba8_rec2020, 0, h * 2, w, h, Generate_Colorspace_Test_Pattern_Pixel);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 3, Compositor_PixelFormat::rgb10a2_rec2100, 0, h * 3, w, h, Generate_Colorspace_Test_Pattern_Pixel);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 4, Compositor_PixelFormat::rgba16f_scrgb, 0, h * 4, w, h, Generate_Colorspace_Test_Pattern_Pixel);
-}
 
 struct Compositor_Scene_Platform_Layer
 {
     /// Cross-platform scene layer definition
     Compositor_Scene_Layer base;
-    /// 4 bytes = RGBA8 or RGB10A2, 8 bytes = RGBA16F, 1 byte = YCbCr8 (3 planes)
-    u8 planepixelwidth[3];
-    /// bit depth of R, G, B, or Y, Cb, Cr components (8, 10, or 16)
-    u8 bitspercomponent;
     /// Used internally for deleting layers not found in a new scene
-    bool expired;
+    bool expired = true;
     /// DirectComposition visual represents the presentation shape (rect) and
     /// various rendering properties
-    IDCompositionVisual* dcompvisual;
+    IDCompositionVisual* dcompvisual = nullptr;
     /// Direct3D swap chain is an image flip book of rendered frames, latest one
     /// is displayed when the Present method is called, followed by Commit to
     /// update the DirectComposition scene
-    IDXGISwapChain4* swapchain;
+    IDXGISwapChain4* swapchain = nullptr;
     /// Direct3D swap chain object we can wait on (using WaitForSingleObjectEx)
     /// to ensure we don't submit more frames when one is already in the queue.
-    HANDLE swapchain_waitable_object;
+    HANDLE swapchain_waitable_object = nullptr;
 };
 
 struct Compositor_Scene_Platform
@@ -288,108 +239,6 @@ void Compositor_CheckDeviceState(Compositor_State* comp)
         Compositor_CreateDevice(comp);
 }
 
-static void Pixel_EncodesRGB(f32 c[], f32 o[])
-{
-    for (u32 i = 0; i < 3; i++)
-    {
-        f32 f = c[i];
-        o[i] = f < 0.0031308f ? f * 12.92f : 1.055f * pow(f, 0.41666f) - 0.055f;
-    }
-    o[3] = c[3];
-}
-
-static void Pixel_Modulate_And_Clamp(f32 c[], f32 scale, f32 low, f32 high)
-{
-    for (u32 i = 0; i < 32; i++)
-    {
-        f32 f = c[i];
-        f *= scale;
-        f = f < low ? low : f < high ? f : high;
-        c[i] = f;
-    }
-}
-
-static void Generate_Image_BGRA8(u32* pixels, Compositor_Scene_Layer* layer)
-{
-    u16 width = layer->width;
-    u16 height = layer->height;
-    for (u16 y = 0; y < height; y++)
-    {
-        for (u16 x = 0; x < width; x++)
-        {
-            auto p = pixels + y * width + x;
-            f32 c[4];
-            layer->pixelcallback(c, x, y, width, height);
-            Pixel_EncodesRGB(c, c);
-            Pixel_Modulate_And_Clamp(c, 255.0f, 0.0f, 255.0f);
-            *p =
-                (u32)c[0] * 0x1 +
-                (u32)c[1] * 0x100 +
-                (u32)c[2] * 0x10000 +
-                (u32)c[3] * 0x1000000;
-        }
-    }
-}
-
-static void Generate_Colorspace_Test_Pattern_BGR10A2(u32* pixels, Compositor_Scene_Layer* layer)
-{
-    u16 width = layer->width;
-    u16 height = layer->height;
-    for (u16 y = 0; y < height; y++)
-    {
-        for (u16 x = 0; x < width; x++)
-        {
-            auto p = pixels + y * width + x;
-            f32 c[4];
-            layer->pixelcallback(c, x, y, width, height);
-            Pixel_EncodesRGB(c, c);
-            Pixel_Modulate_And_Clamp(c, 1023.0f, 0.0f, 1023.0f);
-            *p =
-                (u32)c[0] * 0x1 +
-                (u32)c[1] * 0x400 +
-                (u32)c[2] * 0x100000 +
-                ((u32)c[3] >> 8) * 0xC0000000;
-        }
-    }
-}
-
-/// This converts an f32 to an f16 using bit manipulation (which achieves round
-/// to nearest behavior, which may not be the active floating point mode).
-/// See https://en.wikipedia.org/wiki/Half-precision_floating-point_format and
-/// compare to https://en.wikipedia.org/wiki/Single-precision_floating-point_format
-static u16 ToF16(f32 f)
-{
-    union
-    {
-        f32 f;
-        u32 i;
-    }
-    u;
-    u.f = f;
-    u32 i = u.i;
-    return ((i & 0x8000) >> 16) | ((i & 0x7C000000) >> 13) | ((i & 0x007FE000) >> 13);
-}
-
-static void Generate_Colorspace_Test_Pattern_RGBA16F(u64* pixels, Compositor_Scene_Layer* layer)
-{
-    u16 width = layer->width;
-    u16 height = layer->height;
-    for (u16 y = 0; y < height; y++)
-    {
-        for (u16 x = 0; x < width; x++)
-        {
-            auto p = pixels + y * width + x;
-            f32 c[4];
-            layer->pixelcallback(c, x, y, width, height);
-            *p =
-                (u64)ToF16(c[0]) * 0x1ull +
-                (u64)ToF16(c[1]) * 0x10000ull +
-                (u64)ToF16(c[2]) * 0x100000000ull +
-                (u64)ToF16(c[3]) * 0x1000000000000ull;
-        }
-    }
-}
-
 bool Compositor_Update_Layer(Compositor_State* comp, Compositor_Scene_Platform_Layer* l, const Compositor_Scene_Layer* layer)
 {
     if (!layer)
@@ -448,14 +297,27 @@ bool Compositor_Update_Layer(Compositor_State* comp, Compositor_Scene_Platform_L
     if (l->swapchain == NULL)
     {
         DXGI_SWAP_CHAIN_DESC1 scdesc = {};
-        scdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-        switch (layer->pixelformat)
+        switch (layer->pixelformat & Compositor_Format_Flags::FORMAT_MASK)
         {
-        case Compositor_PixelFormat::rgba16f_scrgb:
+        default:
+            // unknown pixel format - update this code if you encounter this
+            assert(false);
+            scdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            break;
+        case Compositor_Format_Flags::FORMAT_RGBA32F:
+            scdesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            break;
+        case Compositor_Format_Flags::FORMAT_RGBA16F:
             scdesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             break;
-        case Compositor_PixelFormat::rgb10a2_rec2100:
+        case Compositor_Format_Flags::FORMAT_RGB10A2:
             scdesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+            break;
+        case Compositor_Format_Flags::FORMAT_RGBA8:
+            scdesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            break;
+        case Compositor_Format_Flags::FORMAT_BGRA8:
+            scdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
             break;
         }
         scdesc.SampleDesc.Count = 1;
