@@ -4,13 +4,19 @@
 
 // common.cpp : Shared elements between the platforms, such as test scenes
 
+#include <cassert>
 #include <stdlib.h>
 #include "common.h"
 
-const f32 testcolors[3][5] = {
-    {1.0f, 0.4f, 0.1f, 0.1f, 0.4f},
-    {0.4f, 1.0f, 1.0f, 0.4f, 0.1f},
-    {0.1f, 0.1f, 0.4f, 1.0f, 1.0f}
+const f32 testcolors[4][5] = {
+    // Red
+    {  1.0f,  0.4f, -0.1f,  0.1f, 0.4f},
+    // Green
+    {  0.4f,  1.0f,  1.0f,  0.4f, 0.1f},
+    // Blue
+    { -0.1f, -0.1f,  0.4f,  1.0f, 1.0f},
+    // Alpha
+    {  1.0f,  1.0f,  1.0f,  1.0f, 1.0f}
 };
 
 void TestColors_Gradient_PixelCallback(float output[], f32 x, f32 y, f32 width, f32 height)
@@ -18,43 +24,66 @@ void TestColors_Gradient_PixelCallback(float output[], f32 x, f32 y, f32 width, 
     constexpr u32 limit = sizeof(testcolors[0]) / sizeof(testcolors[0][0]);
     constexpr u32 limit1 = limit - 1;
     constexpr u32 limit2 = limit - 2;
-    f32 f = (x / width) * limit;
-    f = f < 0.0f ? 0.0f : f < (float)limit1 ? f : (float)limit;
-    u32 i = (int)f;
+    f32 f = (x / (width - 1.0f)) * limit1;
+    f = f < 0.0f ? 0.0f : f < (float)limit1 ? f : (float)limit1;
+    u32 i = (int)floor(f);
     i = i < 0 ? 0 : i < limit2 ? i : limit2;
-    f32 lerp = f - i;
+    f32 lerp = (f - i) < 1.0f ? (f - i) : 1.0f;
     f32 ilerp = 1.0f - lerp;
-    for (u32 c = 0; c < 3; c++)
+    for (u32 c = 0; c < 4; c++)
         output[c] = testcolors[c][i] * ilerp + testcolors[c][i + 1] * lerp;
-    output[3] = 1.0f;
-}
-
-static u64 Compositor_Scene_Test_Add_Layer(Compositor_Scene* scene, u64 refreshcounter, u64 z, Compositor_PixelFormat pixelformat, u16 x, u16 y, u16 width, u16 height, void (*pixelcallback)(f32 output[4], f32 x, f32 y, f32 width, f32 height))
-{
-    Compositor_Scene_Layer* layer = new Compositor_Scene_Layer();
-    layer->z = z;
-    layer->refreshcounter = refreshcounter;
-    layer->pixelformat = pixelformat;
-    layer->x = x;
-    layer->y = y;
-    layer->width = width;
-    layer->height = height;
-    scene->layers.push_back(layer);
-    return scene->layers.size() - 1;
 }
 
 void Compositor_Scene_Make_Colorspace_Test(Compositor_Scene* scene)
 {
-    u64 refreshcounter = 1;
-    u16 w = 256;
-    u16 h = 32;
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 0, Compositor_PixelFormat::srgb, 0, h * 0, w, h, TestColors_Gradient_PixelCallback);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 1, Compositor_PixelFormat::rec709, 0, h * 1, w, h, TestColors_Gradient_PixelCallback);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 2, Compositor_PixelFormat::dcip3, 0, h * 2, w, h, TestColors_Gradient_PixelCallback);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 3, Compositor_PixelFormat::rec2020_8bit, 0, h * 3, w, h, TestColors_Gradient_PixelCallback);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 4, Compositor_PixelFormat::rec2020_10bit, 0, h * 4, w, h, TestColors_Gradient_PixelCallback);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 5, Compositor_PixelFormat::rec2100_10bit, 0, h * 5, w, h, TestColors_Gradient_PixelCallback);
-    Compositor_Scene_Test_Add_Layer(scene, refreshcounter, 6, Compositor_PixelFormat::rgba16f_scrgb, 0, h * 6, w, h, TestColors_Gradient_PixelCallback);
+    constexpr Compositor_PixelFormat pixelformats[] =
+    {
+        Compositor_PixelFormat::srgb,
+        Compositor_PixelFormat::rec709,
+        // Not supported by Windows DirectComposition
+        // Compositor_PixelFormat::dcip3,
+        Compositor_PixelFormat::rec2020_8bit,
+        Compositor_PixelFormat::rec2020_10bit,
+        Compositor_PixelFormat::rec2100_10bit,
+        Compositor_PixelFormat::rgba16f_scrgb,
+    };
+    constexpr size_t len = sizeof(pixelformats) / sizeof(pixelformats[0]);
+
+    constexpr u64 refreshcounter = 1;
+    constexpr u16 w = 256;
+    constexpr u16 h = 32;
+    scene->layers.clear();
+    scene->layers.reserve(len);
+    // Put a gradient image behind everything
+    u64 sort = 0;
+    scene->layers.push_back(
+        Compositor_Scene_Layer(
+            refreshcounter,
+            sort++,
+            0,
+            0,
+            0,
+            0,
+            TestColors_Gradient_PixelCallback,
+            Compositor_PixelFormat::rgba16f_scrgb,
+            true
+        )
+    );
+    // Add several smaller gradients in different formats
+    for (u64 i = 0; i < len; i++)
+        scene->layers.push_back(
+            Compositor_Scene_Layer(
+                refreshcounter,
+                sort++,
+                0,
+                (u16)(h * i),
+                w,
+                h,
+                TestColors_Gradient_PixelCallback,
+                pixelformats[i],
+                false
+            )
+        );
 }
 
 void Color_OETF(Compositor_PixelFormat pixelformat, f32 c[], f32 o[])
@@ -99,12 +128,13 @@ void Color_OETF(Compositor_PixelFormat pixelformat, f32 c[], f32 o[])
     }
 }
 
-static void Pixel_Modulate_And_Clamp(f32 c[], f32 scale, f32 low, f32 high)
+static void Pixel_To_Int(f32 c[], f32 scale, f32 low, f32 high)
 {
-    for (u32 i = 0; i < 32; i++)
+    for (u32 i = 0; i < 4; i++)
     {
         f32 f = c[i];
         f *= scale;
+        f = floorf(f + 0.5f);
         f = f < low ? low : f < high ? f : high;
         c[i] = f;
     }
@@ -124,7 +154,29 @@ static u16 ToF16(f32 f)
     u;
     u.f = f;
     u32 i = u.i;
-    return ((i & 0x8000) >> 16) | ((i & 0x7C000000) >> 13) | ((i & 0x007FE000) >> 13);
+    // Adjust exponent from +126 bias to +14 bias, if it would become less than
+    // exponent 1 we treat it as a full zero (rather than try to deal with
+    // denormals, which typically have a performance penalty anyway)
+    u32 a = ((i & 0x7FFFFFFF) < 0x38000000) ? 0 : i - 0x38000000;
+    // Shift exponent and mantissa to the correct place (same shift for both)
+    // and put the sign bit into place
+    u16 n = (a >> 13) | ((a & 0x80000000) >> 16);
+    return n;
+}
+
+u8 Compositor_BytesPerPixelFormat(Compositor_PixelFormat pixelformat)
+{
+    switch (pixelformat & Compositor_Format_Flags::FORMAT_MASK)
+    {
+    case Compositor_Format_Flags::FORMAT_RGBA32F: return 16;
+    case Compositor_Format_Flags::FORMAT_RGBA16F: return 8;
+    case Compositor_Format_Flags::FORMAT_RGB10A2: return 4;
+    case Compositor_Format_Flags::FORMAT_RGBA8: return 4;
+    case Compositor_Format_Flags::FORMAT_BGRA8: return 4;
+    default:
+        assert(false);
+        return -1;
+    }
 }
 
 void Generate_Image(void* pixels, Compositor_Scene_Layer* layer)
@@ -140,7 +192,11 @@ void Generate_Image(void* pixels, Compositor_Scene_Layer* layer)
             for (u16 x = 0; x < width; x++)
             {
                 auto p = (f32*)pixels + 4 * (y * width + x);
-                layer->pixelcallback(p, x, y, width, height);
+                f32 c[4];
+                layer->pixelcallback(c, x, y, width, height);
+                Color_OETF(layer->pixelformat, c, c);
+                for (u16 i = 0; i < 4; i++)
+                    p[i] = c[i];
             }
         }
         break;
@@ -149,14 +205,15 @@ void Generate_Image(void* pixels, Compositor_Scene_Layer* layer)
         {
             for (u16 x = 0; x < width; x++)
             {
-                auto p = (u16*)pixels + 4 *(y * width + x);
+                auto p = (u64*)pixels + (y * width + x);
                 f32 c[4];
                 Color_OETF(layer->pixelformat, c, c);
                 layer->pixelcallback(c, x, y, width, height);
-                p[0] = ToF16(c[0]);
-                p[1] = ToF16(c[1]);
-                p[2] = ToF16(c[2]);
-                p[3] = ToF16(c[3]);
+                *p =
+                    (u64)ToF16(c[0]) * 0x1 +
+                    (u64)ToF16(c[1]) * 0x10000 +
+                    (u64)ToF16(c[2]) * 0x100000000 +
+                    (u64)ToF16(c[3]) * 0x1000000000000;
             }
         }
         break;
@@ -169,7 +226,7 @@ void Generate_Image(void* pixels, Compositor_Scene_Layer* layer)
                 f32 c[4];
                 layer->pixelcallback(c, x, y, width, height);
                 Color_OETF(layer->pixelformat, c, c);
-                Pixel_Modulate_And_Clamp(c, 1023.0f, 0.0f, 1023.0f);
+                Pixel_To_Int(c, 1023.0f, 0.0f, 1023.0f);
                 *p =
                     (u32)c[0] * 0x1 +
                     (u32)c[1] * 0x400 +
@@ -187,7 +244,7 @@ void Generate_Image(void* pixels, Compositor_Scene_Layer* layer)
                 f32 c[4];
                 layer->pixelcallback(c, x, y, width, height);
                 Color_OETF(layer->pixelformat, c, c);
-                Pixel_Modulate_And_Clamp(c, 255.0f, 0.0f, 255.0f);
+                Pixel_To_Int(c, 255.0f, 0.0f, 255.0f);
                 *p =
                     (u32)c[0] * 0x1 +
                     (u32)c[1] * 0x100 +
@@ -205,7 +262,7 @@ void Generate_Image(void* pixels, Compositor_Scene_Layer* layer)
                 f32 c[4];
                 layer->pixelcallback(c, x, y, width, height);
                 Color_OETF(layer->pixelformat, c, c);
-                Pixel_Modulate_And_Clamp(c, 255.0f, 0.0f, 255.0f);
+                Pixel_To_Int(c, 255.0f, 0.0f, 255.0f);
                 *p =
                     (u32)c[2] * 0x1 +
                     (u32)c[1] * 0x100 +

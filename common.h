@@ -99,12 +99,14 @@ enum Compositor_PixelFormat
 		Compositor_Format_Flags::WHITE_D65,
 };
 
+typedef void (*Compositor_PixelCallback)(f32 output[4], f32 x, f32 y, f32 width, f32 height);
+
 struct Compositor_Scene_Layer
 {
-	/// Constant identifier for this layer across frames
-	u64 z = 0;
 	/// Frame counter that can be incremented to regenerate the image
 	u64 refreshcounter = 0;
+	/// Constant identifier for this layer across frames
+	u64 sort = 0;
 	/// Coordinates are for 96 DPI, actual sizes determined based on display DPI
 	u16 x = 0;
 	u16 y = 0;
@@ -114,22 +116,26 @@ struct Compositor_Scene_Layer
 	/// Function that will be called to generate each pixel color in the test
 	/// image, x and y are in the range 0..width and 0..height respectively,
 	/// output color is rgba32f_scrgb and will be converted by caller.
-	void (*pixelcallback)(f32 output[4], f32 x, f32 y, f32 width, f32 height) = nullptr;
+	Compositor_PixelCallback pixelcallback = nullptr;
+	/// Indicates this layer should affect the window swapchain rather than creating a composition layer
+	bool wholewindow = false;
+
+	Compositor_Scene_Layer()
+		: refreshcounter(0), sort(0), x(0), y(0), width(0), height(0), pixelcallback(nullptr), pixelformat(Compositor_PixelFormat::srgb), wholewindow(false) {}
+	Compositor_Scene_Layer(u64 _refreshcounter, u64 _sort, u16 _x, u16 _y, u16 _width, u16 _height, Compositor_PixelCallback _pixelcallback, Compositor_PixelFormat _pixelformat, bool _wholewindow)
+		: refreshcounter(_refreshcounter), sort(_sort), x(_x), y(_y), width(_width), height(_height), pixelcallback(_pixelcallback), pixelformat(_pixelformat), wholewindow(_wholewindow) {}
 };
 
 /// For now this is very barebones
 struct Compositor_Scene
 {
-	std::vector<Compositor_Scene_Layer*> layers;
-};
+	std::vector<Compositor_Scene_Layer> layers;
 
-struct Compositor_State;
+	Compositor_Scene() {}
+};
 
 /// Constructs a test scene
 void Compositor_Scene_Make_Colorspace_Test(Compositor_Scene* scene);
 
-/// Initializes the compositor and graphics device if needed, updates all
-/// visuals overlaid on the window to match the current state.
-/// Returns false if an error occurred twice and it has given up (e.g.
-/// repeatedly losing the device).
-bool Compositor_Update(Compositor_State* state, const Compositor_Scene *scene);
+u8 Compositor_BytesPerPixelFormat(Compositor_PixelFormat pixelformat);
+void Generate_Image(void* pixels, Compositor_Scene_Layer* layer);
