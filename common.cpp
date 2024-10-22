@@ -8,15 +8,18 @@
 #include <stdlib.h>
 #include "common.h"
 
-const f32 testcolors[4][5] = {
+// These test colors represent an RGB color wheel, but with deliberately out of
+// gamut colors (which often require negative values for other components) and
+// HDR intensity (2.0 = 160 nits scene referred)
+const f32 testcolors[4][7] = {
     // Red
-    {  1.0f,  0.4f, -0.1f,  0.1f, 0.4f},
+    {  2.00f,  2.00f, -0.25f, -0.25f, -0.25f,  2.00f,  2.00f},
     // Green
-    {  0.4f,  1.0f,  1.0f,  0.4f, 0.1f},
+    { -0.25f,  2.00f,  2.00f,  2.00f, -0.25f, -0.25f, -0.25f},
     // Blue
-    { -0.1f, -0.1f,  0.4f,  1.0f, 1.0f},
+    { -0.25f, -0.25f, -0.25f,  2.00f,  2.00f,  2.00f, -0.25f},
     // Alpha
-    {  1.0f,  1.0f,  1.0f,  1.0f, 1.0f}
+    {  1.00f,  1.00f,  1.00f,  1.00f,  1.00f,  1.00f,  1.00f}
 };
 
 void TestColors_Gradient_PixelCallback(float output[], f32 x, f32 y, f32 width, f32 height)
@@ -146,6 +149,29 @@ static void Pixel_To_Int(f32 c[], f32 scale, f32 low, f32 high)
 /// compare to https://en.wikipedia.org/wiki/Single-precision_floating-point_format
 static u16 ToF16(f32 f)
 {
+    // Some notes:
+    // f32 is 1 sign bit, 8 exponent bits, 23 mantissa bits
+    // f16 is 1 sign bit, 5 exponent bits, 10 mantissa bits
+    // 1.0 as f32 is 0x3f800000 (exp=127 of 0-255)
+    // s0 e01111111 m00000000000000000000000
+    // 1.0 as f16 is 0x7800 (exp=15 of 0-31)
+    // s0 e...01111 m0000000000.............
+    // if we shift the exponents to align the same, 127-15=112, f16 exp is f32
+    // exp - 112, since the sign bit precedes it we need to mask that off before
+    // adjusting, the mantissa directly follows the exponent so we can shift
+    // both by the same amount to align with the f16 format, and subtract 112
+    // from the exponent and we get f16 from f32 with bit math alone.
+    //
+    // e112 = s0 e011100000 m... = 0x38000000
+    // e113 = s0 e011100001 m... = 0x38800000
+    //
+    // We also have to handle the fact that e103 to 112 become denormals, but
+    // it is easier to simply treat <=e112 as zero, a lot of float
+    // implementations either ignore denormals or process them very slowly so
+    // turning them into zero is a reasonable behavior here.
+    //
+    // Note that this simple shift approach inherently applies round-toward-zero
+    // behavior, regardless of the current FPU rounding mode.
     union
     {
         f32 f;
@@ -154,10 +180,10 @@ static u16 ToF16(f32 f)
     u;
     u.f = f;
     u32 i = u.i;
-    // Adjust exponent from +126 bias to +14 bias, if it would become less than
+    // Adjust exponent from +127 bias to +15 bias, if it would become less than
     // exponent 1 we treat it as a full zero (rather than try to deal with
     // denormals, which typically have a performance penalty anyway)
-    u32 a = ((i & 0x7FFFFFFF) < 0x38000000) ? 0 : i - 0x38000000;
+    u32 a = ((i & 0x7FFFFFFF) < 0x38800000) ? 0 : i - 0x38000000;
     // Shift exponent and mantissa to the correct place (same shift for both)
     // and put the sign bit into place
     u16 n = (a >> 13) | ((a & 0x80000000) >> 16);

@@ -425,7 +425,9 @@ static bool Compositor_Update_Layer(Compositor_State* comp, Compositor_Scene_Pla
         if (FAILED(hr))
             return false;
         // Convert the IDXGISwapChain1 to IDXGISwapChain3 because we need a few
-        // more features to do HDR stuff, such as specifying colorspace
+        // more features to do HDR stuff, such as specifying colorspace for
+        // HDR10 (scRGB doesn't need the hint because the scDesc.Format being
+        // R16F16B16A16_FLOAT tells dcomp it is scRGB in that case)
         hr = swapchain1->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&l.swapchain));
         swapchain1->Release();
         if (FAILED(hr))
@@ -626,7 +628,7 @@ bool Compositor_Update(Compositor_State* comp, const Compositor_Scene* scene, HW
         {
             if (l)
             {
-                hr = comp->rootvisual->AddVisual(l->dcompvisual, FALSE, nullptr);
+                hr = comp->rootvisual->AddVisual(l->dcompvisual, TRUE, nullptr);
                 if (FAILED(hr))
                     return false;
             }
