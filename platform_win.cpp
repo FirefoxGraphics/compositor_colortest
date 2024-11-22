@@ -99,8 +99,6 @@ public:
     IDXGISurface* surface = nullptr;
 
     ~Compositor_Layer();
-    void UpdateSwapChain(Compositor* comp, IDXGISwapChain1 *swapchain, void* tPixels);
-    void WindowWithSwapChain(Compositor* comp, u32 _width, u32 _height, DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format, u8 _bpp, void* tPixels);
     void VisualWithSwapChain(Compositor* comp, f32 _x, f32 _y, u32 _width, u32 _height, DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format, u8 _bpp, void* tPixels);
     void VisualWithSurface(Compositor* comp, f32 _x, f32 _y, u32 _width, u32 _height, DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format, u8 _bpp, void* tPixels);
 };
@@ -126,6 +124,7 @@ public:
     IDXGIAdapter* adapter = nullptr;
     IDXGIFactory7* factory = nullptr;
     IDXGISwapChain1* windowswapchain1 = nullptr;
+    IDXGISwapChain3* windowswapchain3 = nullptr;
     IDCompositionDevice* dcomp = nullptr;
     IDCompositionTarget* dcomptarget = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -140,6 +139,8 @@ public:
     void CreateDevice(HWND hWnd);
     void CreateScene();
     void Update(HWND hWnd, bool reset);
+    void MakeWindowSwapChain(DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format);
+    void UpdateSwapChain(IDXGISwapChain1* swapchain, DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format, u8 _bpp, void* tPixels);
 };
 
 void Compositor::DestroyDevice()
@@ -149,6 +150,7 @@ void Compositor::DestroyDevice()
     if (rootvisual) {
         rootvisual->RemoveAllVisuals();
     }
+    SafeRelease(&windowswapchain3);
     SafeRelease(&windowswapchain1);
     SafeRelease(&rootvisual);
     SafeRelease(&adapter);
@@ -180,16 +182,6 @@ void Compositor::CreateDevice(HWND hWnd)
     // Assume device creation failed if this function exits early.
     status = Compositor_Status::Device_Creation_Failed;
     hWindow = hWnd;
-
-    // Get the current DPI of the display the window is on
-    scale = 1.0f;
-    HDC hdc = GetDC(hWindow);
-    if (hdc)
-    {
-        scale = GetDeviceCaps(hdc, LOGPIXELSX) / 96.0f;
-        scale = scale < 1.0f / 1024.0f ? 1.0f / 1024.0f : scale < 1024.0f ? scale : 1024.0f;
-        ReleaseDC(hWindow, hdc);
-    }
 
     u32 flags = 0;
     flags |= D3D11_CREATE_DEVICE_DEBUG;
@@ -246,6 +238,11 @@ void Compositor::CreateDevice(HWND hWnd)
     if (FAILED(hr)) {
         return;
     }
+    hr = dcomptarget->SetRoot(rootvisual);
+    assert(SUCCEEDED(hr));
+    if (FAILED(hr)) {
+        return;
+    }
 
     hr = dxgi->GetAdapter(&adapter);
     assert(SUCCEEDED(hr));
@@ -262,34 +259,12 @@ void Compositor::CreateDevice(HWND hWnd)
         return;
     }
 
-#if !ONLY_DCOMP
-    DXGI_SWAP_CHAIN_DESC1 scDesc = {};
-    scDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    scDesc.BufferCount = 2;
-    scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_SHADER_INPUT;
-    scDesc.Flags = 0;
-    scDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    scDesc.SampleDesc.Count = 1;
-    scDesc.Scaling = DXGI_SCALING_STRETCH;
-    scDesc.Stereo = FALSE;
-    scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    hr = factory->CreateSwapChainForHwnd(
-        d3d,
-        hWnd,
-        &scDesc,
-        nullptr,
-        nullptr,
-        &windowswapchain1
-    );
-    assert(SUCCEEDED(hr));
-#endif
-
     d3d->GetImmediateContext(&context);
 
     status = Compositor_Status::Running;
 }
 
-void Compositor_Layer::UpdateSwapChain(Compositor* comp, IDXGISwapChain1 *swapchain, void* tPixels)
+void Compositor::UpdateSwapChain(IDXGISwapChain1* swapchain, DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format, u8 _bpp, void* tPixels)
 {
     DXGI_SWAP_CHAIN_DESC1 scDesc = {};
     swapchain->GetDesc1(&scDesc);
@@ -301,8 +276,8 @@ void Compositor_Layer::UpdateSwapChain(Compositor* comp, IDXGISwapChain1 *swapch
     tDesc.Height = scDesc.Height;
     tDesc.MipLevels = 1;
     tDesc.ArraySize = 1;
-    tDesc.Format = dxgiFormat;
-    u8 bpp = bytesPerPixel;
+    tDesc.Format = _format;
+    u8 bpp = _bpp;
     // tDesc uses UINT, so let's check for overflow first.
     u64 tPitch = tDesc.Width * bpp;
     u64 tSlicePitch = tPitch * tDesc.Height;
@@ -332,21 +307,21 @@ void Compositor_Layer::UpdateSwapChain(Compositor* comp, IDXGISwapChain1 *swapch
         texBox.bottom = scDesc.Height;
         texBox.front = 0;
         texBox.back = 1;
-        comp->context->UpdateSubresource(buffer, 0, &texBox, tPixels, static_cast<UINT>(tPitch), static_cast<UINT>(tSlicePitch));
+        context->UpdateSubresource(buffer, 0, &texBox, tPixels, static_cast<UINT>(tPitch), static_cast<UINT>(tSlicePitch));
 #else
         // Create a texture to hold the pixels, and set up a shader to
         // copy that into the backbuffer
-        hr = comp->d3d->CreateRenderTargetView(buffer, NULL, &view);
+        hr = d3d->CreateRenderTargetView(buffer, NULL, &view);
         if (SUCCEEDED(hr) && view)
         {
             f32 debugColor[] = { 1.0f, 0.0f, 0.0f, 0.5f };
-            comp->context->ClearRenderTargetView(view, debugColor);
+            context->ClearRenderTargetView(view, debugColor);
 
             D3D11_SUBRESOURCE_DATA tInitData;
             tInitData.SysMemPitch = static_cast<UINT>(tPitch);
             tInitData.SysMemSlicePitch = static_cast<UINT>(tSlicePitch);
             tInitData.pSysMem = tPixels;
-            hr = comp->d3d->CreateTexture2D(&tDesc, &tInitData, &tex);
+            hr = d3d->CreateTexture2D(&tDesc, &tInitData, &tex);
             if (SUCCEEDED(hr) && tex)
             {
                 D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
@@ -354,7 +329,7 @@ void Compositor_Layer::UpdateSwapChain(Compositor* comp, IDXGISwapChain1 *swapch
                 srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
                 srvDesc.Texture2D.MipLevels = 1;
                 ID3D11ShaderResourceView* srv = nullptr;
-                hr = comp->d3d->CreateShaderResourceView(tex, &srvDesc, &srv);
+                hr = d3d->CreateShaderResourceView(tex, &srvDesc, &srv);
                 if (SUCCEEDED(hr) && srv)
                 {
                     // TODO
@@ -380,18 +355,41 @@ void Compositor_Layer::UpdateSwapChain(Compositor* comp, IDXGISwapChain1 *swapch
     assert(SUCCEEDED(hr));
 }
 
-void Compositor_Layer::WindowWithSwapChain(Compositor* comp, u32 _width, u32 _height, DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format, u8 _bpp, void* tPixels)
-{
-    x = 0;
-    y = 0;
-    width = _width;
-    height = _height;
-    dxgiColorspace = _type;
-    dxgiFormat = _format;
-    bytesPerPixel = _bpp;
-    isSurface = false;
-    isWindow = true;
-    UpdateSwapChain(comp, comp->windowswapchain1, tPixels);
+void Compositor::MakeWindowSwapChain(DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format) {
+    if (!windowswapchain1) {
+        DXGI_SWAP_CHAIN_DESC1 scDesc = {};
+        scDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        scDesc.BufferCount = 2;
+        scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_BACK_BUFFER | DXGI_USAGE_SHADER_INPUT;
+        scDesc.Flags = 0;
+        scDesc.Format = _format;
+        scDesc.SampleDesc.Count = 1;
+        scDesc.Scaling = DXGI_SCALING_STRETCH;
+        scDesc.Stereo = FALSE;
+        scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        HRESULT hr = factory->CreateSwapChainForHwnd(
+            d3d,
+            hWindow,
+            &scDesc,
+            nullptr,
+            nullptr,
+            &windowswapchain1
+        );
+        assert(SUCCEEDED(hr));
+        if (FAILED(hr)) {
+            return;
+        }
+        // Convert the IDXGISwapChain1 to IDXGISwapChain3 because we need a few
+        // more features to do HDR stuff, such as specifying colorspace for
+        // HDR10 (scRGB doesn't need the hint because the scDesc.Format being
+        // R16F16B16A16_FLOAT tells dcomp it is scRGB in that case)
+        hr = windowswapchain1->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&windowswapchain3));
+        assert(SUCCEEDED(hr));
+        if (FAILED(hr)) {
+            return;
+        }
+        windowswapchain3->SetColorSpace1(_type);
+    }
 }
 
 void Compositor_Layer::VisualWithSwapChain(Compositor* comp, f32 _x, f32 _y, u32 _width, u32 _height, DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format, u8 _bpp, void *tPixels)
@@ -458,8 +456,9 @@ void Compositor_Layer::VisualWithSwapChain(Compositor* comp, f32 _x, f32 _y, u32
     }
 
     // Render a new frame in the swapchain and present it
-    if (swapchain1 && width >= 1 && height >= 1)
-        UpdateSwapChain(comp, swapchain1, tPixels);
+    if (swapchain1 && width >= 1 && height >= 1) {
+        comp->UpdateSwapChain(swapchain1, _type, _format, _bpp, tPixels);
+    }
 }
 
 void Compositor_Layer::VisualWithSurface(Compositor* comp, f32 _x, f32 _y, u32 _width, u32 _height, DXGI_COLOR_SPACE_TYPE _type, DXGI_FORMAT _format, u8 _bpp, void* tPixels)
@@ -486,36 +485,51 @@ void Compositor_Layer::VisualWithSurface(Compositor* comp, f32 _x, f32 _y, u32 _
     // TODO
 }
 
-
 void Compositor::Update(HWND hWnd, bool reset)
 {
+    // Get the current DPI of the display the window is on
+    f32 newscale = 1.0f;
+    HDC hdc = GetDC(hWnd);
+    if (hdc)
+    {
+        newscale = GetDeviceCaps(hdc, LOGPIXELSX) / 96.0f;
+        newscale = newscale < 1.0f / 1024.0f ? 1.0f / 1024.0f : newscale < 1024.0f ? newscale : 1024.0f;
+        ReleaseDC(hWnd, hdc);
+    }
+    // TODO: Get SDRWhiteLevel from DisplayConfigGetDeviceInfo...
+    if (fabs(scale - newscale) > 0.01f) {
+        reset = true;
+    }
+    scale = newscale;
+    if (hWindow != hWnd) {
+        reset = true;
+    }
+    if (status != Compositor_Status::Running) {
+        reset = true;
+    }
+
     // If an error is encountered, we reinitialize the device and try again, but
     // only once, if the device is lost repeatedly we're not going to make
     // progress, so two attempts is probably optimal
     for (i32 tries = 2; tries >= 0; tries--)
     {
         UpdateStatus();
-        if (status == Compositor_Status::Running) {
-            if (hWindow == hWnd && !reset) {
-                return;
+        if (status != Compositor_Status::Running || reset) {
+            reset = false;
+            DestroyDevice();
+            CreateDevice(hWnd);
+            CreateScene();
+            // Add the layer visuals to our root visual as they must form a tree
+            for (auto layer : layers) {
+                if (layer.dcompvisual) {
+                    HRESULT hr = rootvisual->AddVisual(layer.dcompvisual, TRUE, nullptr);
+                    assert(SUCCEEDED(hr));
+                }
             }
-            break;
-        }
-        DestroyDevice();
-        CreateDevice(hWnd);
-    }
-
-    CreateScene();
-
-    // Add the layer visuals to our root visual as they must form a tree
-    for (auto layer : layers) {
-        if (layer.dcompvisual) {
-            HRESULT hr = rootvisual->AddVisual(layer.dcompvisual, TRUE, nullptr);
-            assert(SUCCEEDED(hr));
+            // Commit transaction so it displays the new layers
+            dcomp->Commit();
         }
     }
-    // Commit transaction so it displays the new layers
-    dcomp->Commit();
 }
 
 Compositor::~Compositor()
@@ -523,21 +537,21 @@ Compositor::~Compositor()
     DestroyDevice();
 }
 
-// These test colors represent an RGB color wheel, but with deliberately out of
-// gamut colors (which often require negative values for other components) and
-// HDR intensity (2.0 = 160 nits scene referred)
+// These test colors represent an scRGB color wheel with deliberately wide gamut
+// colors (which often require negative values for other components) and HDR
+// intensity (2.0 = 160 nits scene referred)
 const f32 testcolors[4][7] = {
     // Red
-    {  2.00f,  2.00f, -0.25f, -0.25f, -0.25f,  2.00f,  2.00f},
+    {  2.00f,  2.00f, -0.20f, -0.20f, -0.20f,  2.00f,  2.00f},
     // Green
-    { -0.25f,  2.00f,  2.00f,  2.00f, -0.25f, -0.25f, -0.25f},
+    { -0.20f,  2.00f,  2.00f,  2.00f, -0.20f, -0.20f, -0.20f},
     // Blue
-    { -0.25f, -0.25f, -0.25f,  2.00f,  2.00f,  2.00f, -0.25f},
+    { -0.20f, -0.20f, -0.20f,  2.00f,  2.00f,  2.00f, -0.20f},
     // Alpha
     {  1.00f,  1.00f,  1.00f,  1.00f,  1.00f,  1.00f,  1.00f}
 };
 
-void TestColors_Gradient_PixelCallback(float output[], f32 x, f32 y, f32 width, f32 height)
+void PixelCallback_TestColors_scRGB(float output[], f32 x, f32 y, f32 width, f32 height)
 {
     constexpr u32 limit = sizeof(testcolors[0]) / sizeof(testcolors[0][0]);
     constexpr u32 limit1 = limit - 1;
@@ -616,14 +630,37 @@ void GenerateImage_RGBA16F_scRGB(u16* pixels, u16 width, u16 height)
         {
             auto p = (u16*)pixels + 4 * (y * width + x);
             f32 c[4];
-            TestColors_Gradient_PixelCallback(c, x, y, width, height);
+            PixelCallback_TestColors_scRGB(c, x, y, width, height);
             for (u16 i = 0; i < 4; i++)
                 p[i] = (u16)ToF16(c[i]);
         }
     }
 }
 
-void Color_OETF_PQ(f32 c[], f32 o[])
+constexpr f32 scrgb_to_xyzd65[3][3] = {
+    { 0.4123908f,  0.3575843f,  0.1804808f},
+    { 0.2126390f,  0.7151687f,  0.0721923f},
+    { 0.0193308f,  0.1191948f,  0.9505322f} };
+
+constexpr f32 xyzd65_to_rec2020[3][3] = {
+    { 1.7166512f, -0.3556708f, -0.2533663f},
+    {-0.6666844f,  1.6164812f,  0.0157685f},
+    { 0.0176399f, -0.0427706f,  0.9421031f} };
+
+void Color_rgb_through_mat3(const f32 c[], f32 o[], const f32 mat[3][3]) {
+    o[0] = c[0] * mat[0][0] + c[1] * mat[0][1] + c[2] * mat[0][2];
+    o[1] = c[0] * mat[1][0] + c[1] * mat[1][1] + c[2] * mat[1][2];
+    o[2] = c[0] * mat[2][0] + c[1] * mat[2][1] + c[2] * mat[2][2];
+}
+
+void Color_scRGB_To_Rec2020(f32 c[3], f32 o[3])
+{
+    f32 xyz[3];
+    Color_rgb_through_mat3(c, xyz, scrgb_to_xyzd65);
+    Color_rgb_through_mat3(xyz, o, xyzd65_to_rec2020);
+}
+
+void Color_Transfer_To_PQ(const f32 c[3], f32 o[3])
 {
     constexpr auto m1 = 2610.0f / 16384.0f;
     constexpr auto m2 = 128.0f * 2523.0f / 4096.0f;
@@ -632,34 +669,42 @@ void Color_OETF_PQ(f32 c[], f32 o[])
     constexpr auto c3 = 32.0f * 2392.0f / 4096.0f;
     for (u32 i = 0; i < 3; i++)
     {
-        f32 j = powf(c[i] / 10000.0f, m1);
-        f32 f = ((c1 + c2 * j) / (1.0f + c3 * j)) * m2;
+        f32 y = c[i] * 80.0f / 10000.0f;
+        y = y < 0.0f ? 0.0f : y;
+        f32 j = powf(y, m1);
+        f32 f = powf((c1 + c2 * j) / (1 + c3 * j), m2);
         o[i] = f < 0.0f ? 0.0f : f < 1.0f ? f : 1.0f;
     }
     o[3] = c[3];
 }
 
-void GenerateImage_RGB10A2_Rec2020_PQ(u32* pixels, u16 width, u16 height)
+// Generates an HDR10 image - converts scRGB gradient to Rec2100 (Rec2020 HDR),
+// uses PQ transfer function and encodes as RGB10A2.
+void GenerateImage_RGB10A2_HDR10(u32* pixels, u16 width, u16 height)
 {
     for (u16 y = 0; y < height; y++)
     {
         for (u16 x = 0; x < width; x++)
         {
             auto p = (u32*)pixels + y * width + x;
-            f32 c[4];
-            TestColors_Gradient_PixelCallback(c, x, y, width, height);
-            Color_OETF_PQ(c, c);
-            Pixel_To_Int(c, 1023.0f, 0.0f, 1023.0f);
+            f32 scrgb[4];
+            PixelCallback_TestColors_scRGB(scrgb, x, y, width, height);
+            f32 rec2020[4];
+            Color_scRGB_To_Rec2020(scrgb, rec2020);
+            f32 t[4];
+            Color_Transfer_To_PQ(rec2020, t);
+            t[3] = scrgb[3];
+            Pixel_To_Int(t, 1023.0f, 0.0f, 1023.0f);
             *p =
-                (u32)c[0] * 0x1 +
-                (u32)c[1] * 0x400 +
-                (u32)c[2] * 0x100000 +
-                ((u32)c[3] >> 8) * 0xC0000000;
+                (u32)t[0] * 0x1 +
+                (u32)t[1] * 0x400 +
+                (u32)t[2] * 0x100000 +
+                ((u32)t[3] >> 8) * 0xC0000000;
         }
     }
 }
 
-void Color_OETF_sRGB(f32 c[], f32 o[])
+void Color_Transfer_To_sRGB(f32 c[], f32 o[])
 {
     // sRGB piecewise gamma
     for (u32 i = 0; i < 3; i++)
@@ -680,8 +725,8 @@ void GenerateImage_BGRA8_sRGB(u32* pixels, u16 width, u16 height)
         {
             auto p = pixels + y * width + x;
             f32 c[4];
-            TestColors_Gradient_PixelCallback(c, x, y, width, height);
-            Color_OETF_sRGB(c, c);
+            PixelCallback_TestColors_scRGB(c, x, y, width, height);
+            Color_Transfer_To_sRGB(c, c);
             Pixel_To_Int(c, 255.0f, 0.0f, 255.0f);
             *p =
                 (u32)c[2] * 0x1 +
@@ -697,6 +742,8 @@ void Compositor::CreateScene()
     layers.clear();
     layers.reserve(16);
 
+#if WINDOW_BACKGROUND
+    MakeWindowSwapChain(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_FORMAT_R16G16B16A16_FLOAT);
     // Get the window swapchain size
     DXGI_SWAP_CHAIN_DESC1 scDesc = {};
     windowswapchain1->GetDesc1(&scDesc);
@@ -704,28 +751,26 @@ void Compositor::CreateScene()
     u32 windowHeight = static_cast<u16>(scDesc.Height);
     windowWidth = windowWidth < 1 ? 1 : windowWidth < 16384 ? windowWidth : 32;
     windowHeight = windowHeight < 1 ? 1 : windowHeight < 16384 ? windowHeight : 32;
-
-    // Put a gradient image behind everything
-    layers.push_back(Compositor_Layer());
     auto pixelsWindow = new u16[4 * windowWidth * windowHeight];
     GenerateImage_RGBA16F_scRGB(pixelsWindow, windowWidth, windowHeight);
-    layers[layers.size() - 1].WindowWithSwapChain(this, windowWidth, windowHeight, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, (void*)pixelsWindow);
+    UpdateSwapChain(windowswapchain1, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, (void*)pixelsWindow);
+#endif
 
     u32 w = (u32)(256.0f * scale);
-    u32 h = (u32)(32.0f * scale);
+    u32 h = (u32)(64.0f * scale);
     w = w < 1 ? 1 : w < 16384 ? w : 16384;
     h = h < 1 ? 1 : h < 16384 ? h : 16384;
     auto pixelsSCRGB16F = new u16[4 * w * h];
     GenerateImage_RGBA16F_scRGB(pixelsSCRGB16F, w, h);
-    auto pixelsRec2020PQ = new u32[w * h];
-    GenerateImage_RGB10A2_Rec2020_PQ(pixelsRec2020PQ, w, h);
+    auto pixelsHDR10 = new u32[w * h];
+    GenerateImage_RGB10A2_HDR10(pixelsHDR10, w, h);
     auto pixelsSRGB8 = new u32[w * h];
     GenerateImage_BGRA8_sRGB(pixelsSRGB8, w, h);
 
     f32 fw = (f32)w;
     f32 fh = (f32)h;
     f32 grid_w = fw + 4 * scale;
-    f32 grid_h = fh + 4 * scale;
+    f32 grid_h = fh;
     f32 x = 32 * scale;
     f32 y = 32 * scale;
 
@@ -734,10 +779,10 @@ void Compositor::CreateScene()
     layers[layers.size() - 1].VisualWithSwapChain(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, (void*)pixelsSCRGB16F);
     y += grid_h;
     layers.push_back(Compositor_Layer());
-    layers[layers.size() - 1].VisualWithSwapChain(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_R10G10B10A2_UNORM, 4, (void*)pixelsRec2020PQ);
+    layers[layers.size() - 1].VisualWithSwapChain(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_R10G10B10A2_UNORM, 4, (void*)pixelsHDR10);
     y += grid_h;
     layers.push_back(Compositor_Layer());
-    layers[layers.size() - 1].VisualWithSwapChain(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_FORMAT_R8G8B8A8_UNORM, 4, (void*)pixelsSRGB8);
+    layers[layers.size() - 1].VisualWithSwapChain(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_FORMAT_B8G8R8A8_UNORM, 4, (void*)pixelsSRGB8);
     y += grid_h;
 
     // Add some smaller gradients as visuals using surfaces in various formats
@@ -747,10 +792,10 @@ void Compositor::CreateScene()
     layers[layers.size() - 1].VisualWithSurface(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, (void*)pixelsSCRGB16F);
     y += grid_h;
     layers.push_back(Compositor_Layer());
-    layers[layers.size() - 1].VisualWithSurface(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_R10G10B10A2_UNORM, 4, (void*)pixelsRec2020PQ);
+    layers[layers.size() - 1].VisualWithSurface(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_R10G10B10A2_UNORM, 4, (void*)pixelsHDR10);
     y += grid_h;
     layers.push_back(Compositor_Layer());
-    layers[layers.size() - 1].VisualWithSurface(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_FORMAT_R8G8B8A8_UNORM, 4, (void*)pixelsSRGB8);
+    layers[layers.size() - 1].VisualWithSurface(this, x, y, w, h, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_FORMAT_B8G8R8A8_UNORM, 4, (void*)pixelsSRGB8);
     y += grid_h;
 }
 
