@@ -128,10 +128,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Resource.h" />
-    <ClInclude Include="common.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="common.cpp" />
     <ClCompile Include="platform_win.cpp" />
   </ItemGroup>
   <ItemGroup>
